@@ -8,17 +8,10 @@ attributes #0 = { "no-jump-tables"="false" }
 define i64 @switch_common_right_bits(i8 %a) #0  {
 ; CHECK-LABEL: @switch_common_right_bits(
 ; CHECK-NEXT:  Entry:
-; CHECK-NEXT:    [[TMP0:%.*]] = add i8 [[A:%.*]], 3
-; CHECK-NEXT:    [[TMP1:%.*]] = tail call i8 @llvm.fshl.i8(i8 [[TMP0]], i8 [[TMP0]], i8 7)
-; CHECK-NEXT:    [[TMP2:%.*]] = icmp ult i8 [[TMP1]], 4
-; CHECK-NEXT:    br i1 [[TMP2]], label [[SWITCH_LOOKUP:%.*]], label [[SWITCHELSE:%.*]]
-; CHECK:       switch.lookup:
-; CHECK-NEXT:    [[TMP3:%.*]] = sext i8 [[TMP1]] to i64
-; CHECK-NEXT:    [[SWITCH_GEP:%.*]] = getelementptr inbounds [4 x i64], [4 x i64]* @switch.table.switch_common_right_bits, i64 0, i64 [[TMP3]]
-; CHECK-NEXT:    [[SWITCH_LOAD:%.*]] = load i64, i64* [[SWITCH_GEP]], align 8
+; CHECK-NEXT:    [[SWITCH_TABLEIDX_ZEXT:%.*]] = zext i8 [[A:%.*]] to i9
+; CHECK-NEXT:    [[SWITCH_GEP:%.*]] = getelementptr inbounds [256 x i64], [256 x i64]* @switch.table.switch_common_right_bits, i32 0, i9 [[SWITCH_TABLEIDX_ZEXT]]
+; CHECK-NEXT:    [[SWITCH_LOAD:%.*]] = load i64, i64* [[SWITCH_GEP]]
 ; CHECK-NEXT:    ret i64 [[SWITCH_LOAD]]
-; CHECK:       SwitchElse:
-; CHECK-NEXT:    ret i64 10
 ;
 Entry:
   switch i8 %a, label %SwitchElse [
@@ -42,13 +35,13 @@ SwitchProng3:                                     ; preds = %Entry
 define i64 @switch_ctz(i16 %a) optsize #0  {
 ; CHECK-LABEL: @switch_ctz(
 ; CHECK-NEXT:  Entry:
-; CHECK-NEXT:    [[TMP0:%.*]] = tail call i16 @llvm.cttz.i16(i16 [[A:%.*]], i1 false), !range !0
-; CHECK-NEXT:    [[TMP1:%.*]] = icmp ult i16 [[TMP0]], 8
-; CHECK-NEXT:    br i1 [[TMP1]], label [[SWITCH_LOOKUP:%.*]], label [[SWITCHELSE:%.*]]
+; CHECK-NEXT:    [[TMP0:%.*]] = call i16 @llvm.cttz.i16(i16 [[A:%.*]], i1 false)
+; CHECK-NEXT:    [[TMP1:%.*]] = sub i16 [[TMP0]], 0
+; CHECK-NEXT:    [[TMP2:%.*]] = icmp ult i16 [[TMP1]], 8
+; CHECK-NEXT:    br i1 [[TMP2]], label [[SWITCH_LOOKUP:%.*]], label [[SWITCHELSE:%.*]]
 ; CHECK:       switch.lookup:
-; CHECK-NEXT:    [[TMP2:%.*]] = zext i16 [[TMP0]] to i64
-; CHECK-NEXT:    [[SWITCH_GEP:%.*]] = getelementptr inbounds [8 x i64], [8 x i64]* @switch.table.switch_ctz, i64 0, i64 [[TMP2]]
-; CHECK-NEXT:    [[SWITCH_LOAD:%.*]] = load i64, i64* [[SWITCH_GEP]], align 8
+; CHECK-NEXT:    [[SWITCH_GEP:%.*]] = getelementptr inbounds [8 x i64], [8 x i64]* @switch.table.switch_ctz, i32 0, i16 [[TMP1]]
+; CHECK-NEXT:    [[SWITCH_LOAD:%.*]] = load i64, i64* [[SWITCH_GEP]]
 ; CHECK-NEXT:    ret i64 [[SWITCH_LOAD]]
 ; CHECK:       SwitchElse:
 ; CHECK-NEXT:    ret i64 10
@@ -87,13 +80,13 @@ SwitchProng7:                                     ; preds = %Entry
 define i64 @switch_clz(i8 %a) optsize #0  {
 ; CHECK-LABEL: @switch_clz(
 ; CHECK-NEXT:  Entry:
-; CHECK-NEXT:    [[TMP0:%.*]] = tail call i8 @llvm.fshl.i8(i8 [[A:%.*]], i8 [[A]], i8 3)
-; CHECK-NEXT:    [[TMP1:%.*]] = icmp ult i8 [[TMP0]], 5
-; CHECK-NEXT:    br i1 [[TMP1]], label [[SWITCH_LOOKUP:%.*]], label [[SWITCHPRONG2:%.*]]
+; CHECK-NEXT:    [[TMP0:%.*]] = sub i8 [[A:%.*]], 0
+; CHECK-NEXT:    [[TMP1:%.*]] = call i8 @llvm.fshr.i8(i8 [[TMP0]], i8 [[TMP0]], i8 5)
+; CHECK-NEXT:    [[TMP2:%.*]] = icmp ult i8 [[TMP1]], 5
+; CHECK-NEXT:    br i1 [[TMP2]], label [[SWITCH_LOOKUP:%.*]], label [[SWITCHPRONG2:%.*]]
 ; CHECK:       switch.lookup:
-; CHECK-NEXT:    [[TMP2:%.*]] = sext i8 [[TMP0]] to i64
-; CHECK-NEXT:    [[SWITCH_GEP:%.*]] = getelementptr inbounds [5 x i64], [5 x i64]* @switch.table.switch_clz, i64 0, i64 [[TMP2]]
-; CHECK-NEXT:    [[SWITCH_LOAD:%.*]] = load i64, i64* [[SWITCH_GEP]], align 8
+; CHECK-NEXT:    [[SWITCH_GEP:%.*]] = getelementptr inbounds [5 x i64], [5 x i64]* @switch.table.switch_clz, i32 0, i8 [[TMP1]]
+; CHECK-NEXT:    [[SWITCH_LOAD:%.*]] = load i64, i64* [[SWITCH_GEP]]
 ; CHECK-NEXT:    ret i64 [[SWITCH_LOAD]]
 ; CHECK:       SwitchProng2:
 ; CHECK-NEXT:    ret i64 12
@@ -122,15 +115,10 @@ SwitchElse:                                     ; preds = %Entry
 define i16 @switch_not_normalized_to_start_at_zero(i8 %a) #0  {
 ; CHECK-LABEL: @switch_not_normalized_to_start_at_zero(
 ; CHECK-NEXT:  Entry:
-; CHECK-NEXT:    [[TMP0:%.*]] = icmp ult i8 [[A:%.*]], 6
-; CHECK-NEXT:    br i1 [[TMP0]], label [[SWITCH_LOOKUP:%.*]], label [[SWITCHELSE:%.*]]
-; CHECK:       switch.lookup:
-; CHECK-NEXT:    [[TMP1:%.*]] = sext i8 [[A]] to i64
-; CHECK-NEXT:    [[SWITCH_GEP:%.*]] = getelementptr inbounds [6 x i16], [6 x i16]* @switch.table.switch_not_normalized_to_start_at_zero, i64 0, i64 [[TMP1]]
-; CHECK-NEXT:    [[SWITCH_LOAD:%.*]] = load i16, i16* [[SWITCH_GEP]], align 2
+; CHECK-NEXT:    [[SWITCH_TABLEIDX_ZEXT:%.*]] = zext i8 [[A:%.*]] to i9
+; CHECK-NEXT:    [[SWITCH_GEP:%.*]] = getelementptr inbounds [256 x i16], [256 x i16]* @switch.table.switch_not_normalized_to_start_at_zero, i32 0, i9 [[SWITCH_TABLEIDX_ZEXT]]
+; CHECK-NEXT:    [[SWITCH_LOAD:%.*]] = load i16, i16* [[SWITCH_GEP]]
 ; CHECK-NEXT:    ret i16 [[SWITCH_LOAD]]
-; CHECK:       SwitchElse:
-; CHECK-NEXT:    ret i16 10
 ;
 Entry:
   switch i8 %a, label %SwitchElse [

@@ -5128,13 +5128,21 @@ static bool
 ShouldBuildLookupTable(SwitchInst *SI, uint64_t TableSize,
                        const TargetTransformInfo &TTI, const DataLayout &DL,
                        const SmallDenseMap<PHINode *, Type *> &ResultTypes) {
-  if (SI->getNumCases() > TableSize || TableSize >= UINT64_MAX / 10)
+  if (SI->getNumCases() > TableSize || TableSize >= UINT64_MAX / (3 * 8))
     return false; // TableSize overflowed, or mul below might overflow.
+
+  // If the table only contains i8 or smaller condition, it has a bounded size of
+  // 256 times the largest legal size, and will be more performant with a lookup table.
+  if (!SI->getFunction()->hasOptSize() &&
+      DL.getTypeAllocSize(SI->getCondition()->getType()) == 1)
+    return true;
 
   bool AllTablesFitInRegister = true;
   bool HasIllegalType = false;
+  unsigned BiggestTypeSize = 0;
   for (const auto &I : ResultTypes) {
     Type *Ty = I.second;
+    unsigned TySize = DL.getTypeAllocSize(Ty);
 
     // Saturate this flag to true.
     HasIllegalType = HasIllegalType || !TTI.isTypeLegal(Ty);
@@ -5143,6 +5151,9 @@ ShouldBuildLookupTable(SwitchInst *SI, uint64_t TableSize,
     AllTablesFitInRegister =
         AllTablesFitInRegister &&
         SwitchLookupTable::WouldFitInRegister(DL, TableSize, Ty);
+
+    if (TySize > BiggestTypeSize)
+      BiggestTypeSize = TySize;
 
     // If both flags saturate, we're done. NOTE: This *only* works with
     // saturating flags, and all flags have to saturate first due to the
@@ -5159,10 +5170,19 @@ ShouldBuildLookupTable(SwitchInst *SI, uint64_t TableSize,
   if (HasIllegalType)
     return false;
 
-  // The table density should be at least 40%. This is the same criterion as for
-  // jump tables, see SelectionDAGBuilder::handleJTSwitchCase.
+  // If the table is smaller, always use it
+  if (TableSize * BiggestTypeSize + 14 <
+    // Table Size, including empty space, plus header size
+        SI->getNumCases() * 14) // size of cmp jmp mov ret on x86_64.
+    return true;
+
+  // Space is more important than performance when using -Os
+  if (SI->getFunction()->hasOptSize())
+    return false;
+
+  // The table density should be at least 33% for 64-bit integers.
   // FIXME: Find the best cut-off.
-  return SI->getNumCases() * 10 >= TableSize * 4;
+  return SI->getNumCases() * 3 * 8 >= (TableSize * BiggestTypeSize);
 }
 
 /// Try to reuse the switch table index compare. Following pattern:
@@ -5247,6 +5267,11 @@ static void reuseTableCompare(
     ++NumTableCmpReuses;
   }
 }
+
+// FIXME Move this function up here when commiting. This makes the patch easier to read.
+static bool ReduceSwitchRange(SwitchInst *SI, IRBuilder<> &Builder,
+                              const DataLayout &DL,
+                              const TargetTransformInfo &TTI);
 
 /// If the switch is only used to initialize one or more phi nodes in a common
 /// successor block with different constant values, replace the switch with
@@ -5343,6 +5368,39 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
     DefaultResults[PHI] = Result;
   }
 
+  // Compute the maximum table size representable by the integer type we are
+  // switching upon.
+  unsigned CaseSize = MaxCaseVal->getType()->getPrimitiveSizeInBits();
+  uint64_t MaxTableSize = CaseSize > 63 ? UINT64_MAX : 1ULL << CaseSize;
+  assert(MaxTableSize >= TableSize &&
+         "It is impossible for a switch to have more entries than the max "
+         "representable value of its input integer type's size.");
+
+  // If the table is only a u8 and we do not have to check for the default case,
+  // extend the table so we can get rid of the branch.
+  if (MaxTableSize <= 256 && HasDefaultResults && !SI->getFunction()->hasOptSize()) {
+    TableSize = MaxTableSize;
+    // Un-rotate and un-xor now that we are covering the whole range,
+    ConstantInt *CAdd = nullptr, *CSub = nullptr, *CXor = nullptr;
+    Value *V;
+    if (match(SI->getCondition(), m_Add(m_Value(V), m_ConstantInt(CAdd))) ||
+        match(SI->getCondition(), m_Sub(m_Value(V), m_ConstantInt(CSub))) ||
+        match(SI->getCondition(), m_Xor(m_Value(V), m_ConstantInt(CXor)))) {
+      for (auto Case : SI->cases()) {
+        auto *Orig = Case.getCaseValue();
+        auto Sub = CAdd ? Orig->getValue() - CAdd->getValue() : Orig->getValue();
+        auto Add = CSub ? Sub + CSub->getValue() : Sub;
+        auto Xor = (CXor ? Add ^ CXor->getValue() : Add);
+        Case.setValue(cast<ConstantInt>(
+          ConstantInt::get(MaxCaseVal->getContext(), Xor)));
+      }
+      SI->setCondition(V);
+      return true; // We will get called again
+    }
+  // Call this from in here, because we need the context necessary for this if/else
+  } else if (ReduceSwitchRange(SI, Builder, DL, TTI))
+    return true; // We will get called again
+
   if (!ShouldBuildLookupTable(SI, TableSize, TTI, DL, ResultTypes))
     return false;
 
@@ -5351,17 +5409,8 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
   BasicBlock *LookupBB = BasicBlock::Create(
       Mod.getContext(), "switch.lookup", CommonDest->getParent(), CommonDest);
 
-  // Compute the table index value.
   Builder.SetInsertPoint(SI);
   Value *TableIndex = SI->getCondition();
-
-  // Compute the maximum table size representable by the integer type we are
-  // switching upon.
-  unsigned CaseSize = MaxCaseVal->getType()->getPrimitiveSizeInBits();
-  uint64_t MaxTableSize = CaseSize > 63 ? UINT64_MAX : 1ULL << CaseSize;
-  assert(MaxTableSize >= TableSize &&
-         "It is impossible for a switch to have more entries than the max "
-         "representable value of its input integer type's size.");
 
   // If the default destination is unreachable, or if the lookup table covers
   // all values of the conditional variable, branch directly to the lookup table
@@ -5652,9 +5701,6 @@ bool SimplifyCFGOpt::SimplifySwitch(SwitchInst *SI, IRBuilder<> &Builder) {
   if (Options.ForwardSwitchCondToPhi && ForwardSwitchConditionToPHI(SI))
     return requestResimplify();
 
-  if (ReduceSwitchRange(SI, Builder, DL, TTI))
-    return requestResimplify();
-
   // The conversion from switch to lookup tables results in difficult-to-analyze
   // code and makes pruning branches much harder. This is a problem if the
   // switch expression itself can still be restricted as a result of inlining or
@@ -5662,6 +5708,10 @@ bool SimplifyCFGOpt::SimplifySwitch(SwitchInst *SI, IRBuilder<> &Builder) {
   // optimisation pipeline.
   if (Options.ConvertSwitchToLookupTable &&
       SwitchToLookupTable(SI, Builder, DL, TTI))
+    return requestResimplify();
+
+  // This is also called within SwitchToLookupTable
+  if (ReduceSwitchRange(SI, Builder, DL, TTI))
     return requestResimplify();
 
   return false;
