@@ -61,6 +61,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/KnownBits.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -4884,7 +4885,8 @@ public:
   SwitchLookupTable(
       Module &M, uint64_t TableSize,
       const SmallVectorImpl<std::pair<ConstantInt *, Constant *>> &Values,
-      Constant *DefaultValue, const DataLayout &DL, const StringRef &FuncName);
+      Constant *DefaultValue, const DataLayout &DL, const StringRef &FuncName,
+      bool UseSparseMap);
 
   /// Build instructions with Builder to retrieve the value at
   /// the position given by Index in the lookup table.
@@ -4915,7 +4917,20 @@ private:
 
     // The table is stored as an array of values. Values are retrieved by load
     // instructions from the table.
-    ArrayKind
+    ArrayKind,
+
+    // The table is stored as an array, but with a sparse map so that the array can
+    // be dense. Values are retrieved by doing a hole check (if the default
+    // is reachable), then generating a mask and adding the running count to
+    // the result of popcnt to get the position in the table.
+    // A sparse map is an array of:
+    // struct {
+    //   uint32_t _pad, // First contains numer of array elements (x16 for bytes)
+    //                  // of array when default is reachable
+    //   uint32_t Count,
+    //   uint64_t Map,
+    // } SparseMap;
+    ArrayWithSparseMapKind,
   } Kind;
 
   // For SingleValueKind, this is the single value.
@@ -4929,8 +4944,15 @@ private:
   ConstantInt *LinearOffset = nullptr;
   ConstantInt *LinearMultiplier = nullptr;
 
-  // For ArrayKind, this is the array.
+  // For ArrayKind and ArrayWithSparseMapKind, this is the array.
   GlobalVariable *Array = nullptr;
+
+  // For ArrayWithSparseMapKind, this is the sparse map, default value, and
+  // lookup function.
+  GlobalVariable *SparseMap = nullptr;
+  Value *Default = nullptr;
+  FunctionCallee LookupFunc = {nullptr, nullptr};
+  bool DefaultHasCode;
 };
 
 } // end anonymous namespace
@@ -4938,84 +4960,42 @@ private:
 SwitchLookupTable::SwitchLookupTable(
     Module &M, uint64_t TableSize,
     const SmallVectorImpl<std::pair<ConstantInt *, Constant *>> &Values,
-    Constant *DefaultValue, const DataLayout &DL, const StringRef &FuncName) {
+    Constant *DefaultValue, const DataLayout &DL, const StringRef &FuncName,
+    bool UseSparseMap) {
   assert(Values.size() && "Can't build lookup table without values!");
   assert(TableSize >= Values.size() && "Can't fit values in table!");
 
-  // If all values in the table are equal, this is that value.
-  SingleValue = Values.begin()->second;
-
   Type *ValueType = Values.begin()->second->getType();
 
-  // Build up the table contents.
-  SmallVector<Constant *, 64> TableContents(TableSize);
-  for (size_t I = 0, E = Values.size(); I != E; ++I) {
-    ConstantInt *CaseVal = Values[I].first;
-    Constant *CaseRes = Values[I].second;
-    assert(CaseRes->getType() == ValueType);
+  SmallVector<Constant *, 64> TableContents(UseSparseMap ? Values.size() : TableSize);
+  if (UseSparseMap) {
+    assert(Values.size() < (1ULL << 32) && "Sparse maps cannot be larger than UINT32_MAX");
+    // Build up the table contents.
+    for (size_t I = 0, E = Values.size(); I != E; ++I) {
+      Constant *CaseRes = Values[I].second;
+      assert(CaseRes->getType() == ValueType);
 
-    uint64_t Idx = CaseVal->getValue().getLimitedValue();
-    TableContents[Idx] = CaseRes;
+      TableContents[I] = CaseRes;
+    }
+  } else {
+    // Build up the table contents.
+    for (size_t I = 0, E = Values.size(); I != E; ++I) {
+      ConstantInt *CaseVal = Values[I].first;
+      Constant *CaseRes = Values[I].second;
+      assert(CaseRes->getType() == ValueType);
 
-    if (CaseRes != SingleValue)
-      SingleValue = nullptr;
-  }
-
-  // Fill in any holes in the table with the default result.
-  if (Values.size() < TableSize) {
-    assert(DefaultValue &&
-           "Need a default value to fill the lookup table holes.");
-    assert(DefaultValue->getType() == ValueType);
-    for (uint64_t I = 0; I < TableSize; ++I) {
-      if (!TableContents[I])
-        TableContents[I] = DefaultValue;
+      uint64_t Idx = CaseVal->getValue().getLimitedValue();
+      TableContents[Idx] = CaseRes;
     }
 
-    if (DefaultValue != SingleValue)
-      SingleValue = nullptr;
-  }
-
-  // If each element in the table contains the same value, we only need to store
-  // that single value.
-  if (SingleValue) {
-    Kind = SingleValueKind;
-    return;
-  }
-
-  // Check if we can derive the value with a linear transformation from the
-  // table index.
-  if (isa<IntegerType>(ValueType)) {
-    bool LinearMappingPossible = true;
-    APInt PrevVal;
-    APInt DistToPrev;
-    assert(TableSize >= 2 && "Should be a SingleValue table.");
-    // Check if there is the same distance between two consecutive values.
-    for (uint64_t I = 0; I < TableSize; ++I) {
-      ConstantInt *ConstVal = dyn_cast<ConstantInt>(TableContents[I]);
-      if (!ConstVal) {
-        // This is an undef. We could deal with it, but undefs in lookup tables
-        // are very seldom. It's probably not worth the additional complexity.
-        LinearMappingPossible = false;
-        break;
+    // Fill in any holes in the table with the default result.
+    // (nullptr means unreachable)
+    if (Values.size() < TableSize && DefaultValue) {
+      assert(DefaultValue->getType() == ValueType);
+      for (uint64_t I = 0; I < TableSize; ++I) {
+        if (!TableContents[I])
+          TableContents[I] = DefaultValue;
       }
-      const APInt &Val = ConstVal->getValue();
-      if (I != 0) {
-        APInt Dist = Val - PrevVal;
-        if (I == 1) {
-          DistToPrev = Dist;
-        } else if (Dist != DistToPrev) {
-          LinearMappingPossible = false;
-          break;
-        }
-      }
-      PrevVal = Val;
-    }
-    if (LinearMappingPossible) {
-      LinearOffset = cast<ConstantInt>(TableContents[0]);
-      LinearMultiplier = ConstantInt::get(M.getContext(), DistToPrev);
-      Kind = LinearMapKind;
-      ++NumLinearMaps;
-      return;
     }
   }
 
@@ -5039,7 +5019,7 @@ SwitchLookupTable::SwitchLookupTable(
   }
 
   // Store the table in an array.
-  ArrayType *ArrayTy = ArrayType::get(ValueType, TableSize);
+  ArrayType *ArrayTy = ArrayType::get(ValueType, UseSparseMap ? Values.size() : TableSize);
   Constant *Initializer = ConstantArray::get(ArrayTy, TableContents);
 
   Array = new GlobalVariable(M, ArrayTy, /*constant=*/true,
@@ -5049,7 +5029,80 @@ SwitchLookupTable::SwitchLookupTable(
   // Set the alignment to that of an array items. We will be only loading one
   // value out of it.
   Array->setAlignment(DL.getPrefTypeAlignment(ValueType));
-  Kind = ArrayKind;
+  if (!UseSparseMap) {
+    Kind = ArrayKind;
+    return;
+  }
+  LLVMContext &Ctx = ValueType->getContext();
+  Type *SparseMapTy = IntegerType::get(Ctx, 64);
+  Type *CountTy = IntegerType::get(Ctx, 32);
+  StructType *SparseStructTy = StructType::create({CountTy, CountTy, SparseMapTy});
+  ArrayType *SparseStructArrayTy = ArrayType::get(SparseStructTy, (TableSize + 63) / 64);
+
+  SmallVector<uint64_t, 64> SparseMapSingle((TableSize + 63) / 64);
+  SmallVector<uint32_t, 64> SparseMapCounts((TableSize + 63) / 64);
+  SmallVector<Constant *, 64> SparseMapContents((TableSize + 63) / 64);
+  for (uint32_t I = 0, E = Values.size(); I != E; ++I) {
+    ConstantInt *CaseVal = Values[I].first;
+
+    uint64_t Idx = CaseVal->getValue().getLimitedValue();
+    if (SparseMapCounts[Idx / 64] == 0 && (Idx / 64) != 0)
+      SparseMapCounts[Idx / 64] = I - 1;
+    else if (Idx / 64 == 0)
+      // This is a trick so that the first entry can be at index 0,
+      // but we can still use a 32-bit counter.
+      SparseMapCounts[Idx / 64] = (uint32_t)-1;
+    SparseMapSingle[Idx / 64] |= 1ULL << (Idx % 64);
+  }
+  for (size_t I = 0, E = ((TableSize + 63) / 64); I != E; ++I) {
+    Constant *CI[3] = {
+      ConstantInt::get(CountTy, (DefaultValue && (I == 0)) ? E : 0),
+      ConstantInt::get(CountTy, SparseMapCounts[I]),
+      ConstantInt::get(SparseMapTy, SparseMapSingle[I])
+    };
+    SparseMapContents[I] = ConstantStruct::get(SparseStructTy, CI);
+  }
+  Constant *Initializer2 = ConstantArray::get(SparseStructArrayTy, SparseMapContents);
+  SparseMap = new GlobalVariable(M, SparseStructArrayTy, /*constant=*/true,
+                             GlobalVariable::PrivateLinkage, Initializer2,
+                             "switch.sparsemap." + FuncName);
+  SparseMap->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+  SparseMap->setAlignment(DL.getPrefTypeAlignment(SparseStructTy));
+
+  unsigned FuncSize = ValueType->getPrimitiveSizeInBits();
+  if (FuncSize <= 8) FuncSize = 8;
+  else if (FuncSize <= 16) FuncSize = 16;
+  else if (FuncSize <= 32) FuncSize = 32;
+  else if (FuncSize <= 64) FuncSize = 64;
+  else llvm_unreachable("Shouldn't be larger than 64-bits.");
+  assert(DL.getTypeAllocSize(ValueType) == FuncSize / 8 && "Bit packing not as expected!");
+  Default = DefaultValue;
+  DefaultHasCode = true;
+  if (Default && isa<ConstantInt>(Default) && cast<ConstantInt>(Default)->getBitWidth() <= FuncSize) {
+    DefaultHasCode = false;
+  }
+  std::string FuncN = formatv("{0}{1}{2}",
+    "__getsparse",
+    FuncSize,
+    DefaultValue ? (DefaultHasCode ? "c" : "") : "u"
+  );
+  Type *SparseMapPtrTy = PointerType::getUnqual(SparseStructTy);
+  Type *ArrayPtrTy = PointerType::getUnqual(ValueType);
+  Type *FuncSizeTy = IntegerType::get(Ctx, FuncSize);
+  FunctionType *FTy;
+  if (!Default)
+    FTy = FunctionType::get(FuncSizeTy,
+      {FuncSizeTy, SparseMapPtrTy, ArrayPtrTy}, /*VarArgs=*/false);
+  else if (DefaultHasCode)
+    FTy = FunctionType::get(FuncSizeTy,
+      {FuncSizeTy, FuncSizeTy, SparseMapPtrTy, ArrayPtrTy}, /*VarArgs=*/false);
+  else
+    // The default is deliberately the first argument, so that on some
+    // architectures no mov is needed to return it.
+    FTy = FunctionType::get(FuncSizeTy,
+      {FuncSizeTy, FuncSizeTy, SparseMapPtrTy, ArrayPtrTy}, /*VarArgs=*/false);
+  LookupFunc = M.getOrInsertFunction(FuncN, FTy);
+  Kind = ArrayWithSparseMapKind;
 }
 
 Value *SwitchLookupTable::BuildLookup(Value *Index, IRBuilder<> &Builder) {
@@ -5103,6 +5156,29 @@ Value *SwitchLookupTable::BuildLookup(Value *Index, IRBuilder<> &Builder) {
         cast<ArrayType>(Array->getValueType())->getElementType(), GEP,
         "switch.load");
   }
+  case ArrayWithSparseMapKind: {
+    LLVMContext &Ctx = Index->getType()->getContext();
+    unsigned IndexBW = LookupFunc.getFunctionType()->getParamType(Default ? 1 : 0)->getPrimitiveSizeInBits();
+    Index = Builder.CreateZExt(Index, IntegerType::get(Ctx, IndexBW),
+        "switch.tableidx.zext");
+
+    Value *SparseMapPtr = Builder.CreateConstGEP2_64(SparseMap, 0, 0);
+    Value *ArrayPtr = Builder.CreateConstGEP2_64(Array, 0, 0);
+    if (!Default)
+      return Builder.CreateCall(
+        LookupFunc, {Index, SparseMapPtr, ArrayPtr});
+    else if (DefaultHasCode)
+      return Builder.CreateCall(
+        LookupFunc, {Default, Index, SparseMapPtr, ArrayPtr});
+    else {
+      APInt DI = cast<ConstantInt>(Default)->getValue();
+      assert(DI.getBitWidth() <= IndexBW && "Default doesn't fit!");
+      return Builder.CreateCall(
+        LookupFunc, {
+          ConstantInt::get(Ctx, DI.zextOrSelf(IndexBW)),
+          Index, SparseMapPtr, ArrayPtr});
+    }
+  }
   }
   llvm_unreachable("Unknown lookup table kind!");
 }
@@ -5127,7 +5203,8 @@ bool SwitchLookupTable::WouldFitInRegister(const DataLayout &DL,
 static bool
 ShouldBuildLookupTable(SwitchInst *SI, uint64_t TableSize,
                        const TargetTransformInfo &TTI, const DataLayout &DL,
-                       const SmallDenseMap<PHINode *, Type *> &ResultTypes) {
+                       const SmallDenseMap<PHINode *, Type *> &ResultTypes,
+                       unsigned *RetLargestSize) {
   if (SI->getNumCases() > TableSize || TableSize >= UINT64_MAX / (3 * 8))
     return false; // TableSize overflowed, or mul below might overflow.
 
@@ -5169,6 +5246,8 @@ ShouldBuildLookupTable(SwitchInst *SI, uint64_t TableSize,
   // Don't build a table that doesn't fit in-register if it has illegal types.
   if (HasIllegalType)
     return false;
+
+  *RetLargestSize = BiggestTypeSize;
 
   // If the table is smaller, always use it
   if (TableSize * BiggestTypeSize + 14 <
@@ -5297,7 +5376,9 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
 
   // Ignore switches with less than three cases. Lookup tables will not make
   // them faster, so we don't analyze them.
-  if (SI->getNumCases() < 3)
+  // Also, limit to to 4 billion cases, as sparse maps are limited to that,
+  // and then we don't have to deal with a bunch of edge cases.
+  if (SI->getNumCases() < 3 || SI->getNumCases() >= (1ULL << 32))
     return false;
 
   // Figure out the corresponding result for each case value and phi node in the
@@ -5347,20 +5428,17 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
   bool TableHasHoles = (NumResults < TableSize);
 
   // If the table has holes, we need a constant result for the default case
-  // or a bitmask that fits in a register.
+  // or a sparse map
   SmallVector<std::pair<PHINode *, Constant *>, 4> DefaultResultsList;
   bool HasDefaultResults =
       GetCaseResults(SI, nullptr, SI->getDefaultDest(), &CommonDest,
                      DefaultResultsList, DL, TTI);
 
   bool NeedMask = (TableHasHoles && !HasDefaultResults);
-  if (NeedMask) {
+  if (NeedMask)
     // As an extra penalty for the validity test we require more cases.
     if (SI->getNumCases() < 4) // FIXME: Find best threshold value (benchmark).
       return false;
-    if (!DL.fitsInLegalInteger(TableSize))
-      return false;
-  }
 
   for (const auto &I : DefaultResultsList) {
     PHINode *PHI = I.first;
@@ -5371,6 +5449,8 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
   // Compute the maximum table size representable by the integer type we are
   // switching upon.
   unsigned CaseSize = MaxCaseVal->getType()->getPrimitiveSizeInBits();
+  // FIXME: This does not analyze if SI->getCondition()'s range is limited
+  // (i.e. by Intrinsic::ctlz or lshr)
   uint64_t MaxTableSize = CaseSize > 63 ? UINT64_MAX : 1ULL << CaseSize;
   assert(MaxTableSize >= TableSize &&
          "It is impossible for a switch to have more entries than the max "
@@ -5401,7 +5481,15 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
   } else if (ReduceSwitchRange(SI, Builder, DL, TTI))
     return true; // We will get called again
 
-  if (!ShouldBuildLookupTable(SI, TableSize, TTI, DL, ResultTypes))
+  const bool DefaultIsReachable =
+      !isa<UnreachableInst>(SI->getDefaultDest()->getFirstNonPHIOrDbg());
+
+  // Sparse Maps cannot be larger than this, if the default is reachable.
+  if ((MaxCaseVal->getValue().getLimitedValue() >= (1ULL << 38)) && DefaultIsReachable)
+    return false;
+
+  unsigned CaseSizeInArray;
+  if (!ShouldBuildLookupTable(SI, TableSize, TTI, DL, ResultTypes, &CaseSizeInArray))
     return false;
 
   // Create the BB that does the lookups.
@@ -5415,12 +5503,13 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
   // If the default destination is unreachable, or if the lookup table covers
   // all values of the conditional variable, branch directly to the lookup table
   // BB. Otherwise, check that the condition is within the case range.
-  const bool DefaultIsReachable =
-      !isa<UnreachableInst>(SI->getDefaultDest()->getFirstNonPHIOrDbg());
+  // SparseMap also includes a range check.
   const bool GeneratingCoveredLookupTable = (MaxTableSize == TableSize);
   BranchInst *RangeCheckBranch = nullptr;
 
-  if (!DefaultIsReachable || GeneratingCoveredLookupTable) {
+  bool UseSparseMap = NeedMask || (TableSize - NumResults) * CaseSizeInArray >
+    ((SI->getFunction()->hasOptSize() || !DefaultIsReachable) ? 16 : 256);
+  if (!DefaultIsReachable || GeneratingCoveredLookupTable || UseSparseMap) {
     Builder.CreateBr(LookupBB);
     // Note: We call removeProdecessor later since we need to be able to get the
     // PHI value for the default case in case we're using a bit mask.
@@ -5434,11 +5523,6 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
   // Populate the BB that does the lookups.
   Builder.SetInsertPoint(LookupBB);
 
-  if (NeedMask) {
-    // Re-written in a later patch
-    return false;
-  }
-
   if (!DefaultIsReachable || GeneratingCoveredLookupTable) {
     // We cached PHINodes in PHIs. To avoid accessing deleted PHINodes later,
     // do not delete PHINodes here.
@@ -5450,11 +5534,10 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
   for (PHINode *PHI : PHIs) {
     const ResultListTy &ResultList = ResultLists[PHI];
 
-    // If using a bitmask, use any value to fill the lookup table holes.
-    Constant *DV = NeedMask ? ResultLists[PHI][0].second : DefaultResults[PHI];
+    Constant *DV = DefaultIsReachable ? DefaultResults[PHI] : nullptr;
     StringRef FuncName = Fn->getName();
     SwitchLookupTable Table(Mod, TableSize, ResultList, DV, DL,
-                            FuncName);
+                            FuncName, UseSparseMap);
 
     Value *Result = Table.BuildLookup(TableIndex, Builder);
 
@@ -5494,7 +5577,7 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
   SI->eraseFromParent();
 
   ++NumLookupTables;
-  if (NeedMask)
+  if (UseSparseMap)
     ++NumLookupTablesHoles;
   return true;
 }
